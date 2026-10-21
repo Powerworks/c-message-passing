@@ -1,0 +1,15 @@
+flowchart TD
+    S[Scheduler] -->|round-robin| P[ping actor]
+    S -->|round-robin| Q[pong actor]
+    
+    P -->|send MSG_PING| QM[(pong mailbox)]
+    Q -->|send MSG_PONG| PM[(ping mailbox)]
+    
+    QM -->|pop| Q
+    PM -->|pop| P
+    
+    style S fill:#f9f,stroke:#333
+    style P fill:#bbf,stroke:#333
+    style Q fill:#bbf,stroke:#333
+    style QM fill:#bfb,stroke:#333
+    style PM fill:#bfb,stroke:#333

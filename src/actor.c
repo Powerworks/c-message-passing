@@ -7,9 +7,17 @@
 
 static Actor *g_actors[MAX_ACTORS];
 static size_t  g_actor_count = 0;
+static size_t  g_enqueue_seq = 0;
 static volatile bool g_stop_requested = false;
 
-/* ---------- mailbox helpers ---------- */
+/* ---------- mailbox helpers (priority-ordered) ---------- */
+
+static int mailbox_compare(const void *a, const void *b) {
+    const Message *ma = *(const Message *const *)a;
+    const Message *mb = *(const Message *const *)b;
+    if (ma->priority != mb->priority) return mb->priority - ma->priority; /* higher first */
+    return (int)(ma->enqueue_seq - mb->enqueue_seq); /* FIFO within priority */
+}
 
 static bool mailbox_push(Actor *a, const Message *msg) {
     if (a->mailbox_len == a->mailbox_cap) {
@@ -24,36 +32,31 @@ static bool mailbox_push(Actor *a, const Message *msg) {
     if (!copy) return false;
 
     *copy = *msg;
+    copy->enqueue_seq = g_enqueue_seq++;
     if (msg->payload_size > 0) {
         copy->payload = malloc(msg->payload_size);
-        if (!copy->payload) {
-            free(copy);
-            return false;
-        }
+        if (!copy->payload) { free(copy); return false; }
         memcpy(copy->payload, msg->payload, msg->payload_size);
     } else {
         copy->payload = NULL;
     }
 
     a->mailbox[a->mailbox_len++] = copy;
+    qsort(a->mailbox, a->mailbox_len, sizeof(Message *), mailbox_compare);
     return true;
 }
 
 static bool mailbox_pop(Actor *a, Message *out) {
     if (a->mailbox_len == 0) return false;
-
     Message *front = a->mailbox[0];
     *out = *front;
-
-    /* shift remaining messages down */
     memmove(a->mailbox, a->mailbox + 1, (a->mailbox_len - 1) * sizeof(Message *));
     a->mailbox_len--;
-
     free(front);
     return true;
 }
 
-/* ---------- actor API ---------- */
+/* ---------- actor registry (named lookup) ---------- */
 
 Actor *actor_spawn(const char *name, ActorFn fn, void *state) {
     if (g_actor_count >= MAX_ACTORS) return NULL;
@@ -63,21 +66,34 @@ Actor *actor_spawn(const char *name, ActorFn fn, void *state) {
 
     a->fn = fn;
     a->state = state;
-    strncpy(a->name, name, sizeof(a->name) - 1);
-    a->name[sizeof(a->name) - 1] = '\0';
+    if (name) {
+        strncpy(a->name, name, sizeof(a->name) - 1);
+        a->name[sizeof(a->name) - 1] = '\0';
+        a->named = true;
+    }
 
     g_actors[g_actor_count++] = a;
     return a;
 }
 
-void actor_send(Actor *dest, int type, const void *payload, size_t payload_size, Actor *sender) {
+Actor *actor_lookup(const char *name) {
+    if (!name) return NULL;
+    for (size_t i = 0; i < g_actor_count; i++) {
+        if (g_actors[i]->named && strcmp(g_actors[i]->name, name) == 0)
+            return g_actors[i];
+    }
+    return NULL;
+}
+
+void actor_send(Actor *dest, int type, const void *payload, size_t payload_size, Actor *sender, int priority) {
     Message msg = {
         .type         = type,
         .payload      = (void *)payload,
         .payload_size = payload_size,
         .sender       = sender,
+        .priority     = priority,
     };
-    (void)mailbox_push(dest, &msg); /* best effort; in production we'd handle OOM */
+    (void)mailbox_push(dest, &msg);
 }
 
 bool actor_receive(Actor *self, Message *out) {
@@ -105,30 +121,22 @@ void actor_scheduler_run(void) {
             Message msg;
             if (actor_receive(a, &msg)) {
                 a->fn(a, &msg, a->state);
-
-                /* If the actor set itself stopped inside its handler, skip it next round */
                 if (a->stopped) continue;
             }
-
-            /* Free any leftover message struct fields if the handler didn't consume payload */
-            /* (payload ownership stays with the message queue; handler borrows only) */
         }
     }
 }
-
-/* ---------- cleanup ---------- */
 
 void actor_shutdown_all(void) {
     for (size_t i = 0; i < g_actor_count; i++) {
         Actor *a = g_actors[i];
         while (a->mailbox_len > 0) {
             Message m;
-            if (mailbox_pop(a, &m)) {
-                free(m.payload);
-            }
+            if (mailbox_pop(a, &m)) free(m.payload);
         }
         free(a->mailbox);
         free(a);
     }
     g_actor_count = 0;
+    g_enqueue_seq = 0;
 }
